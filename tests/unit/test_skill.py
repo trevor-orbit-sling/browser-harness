@@ -33,3 +33,12 @@ def test_packaged_skill_frontmatter_is_valid_simple_yaml():
         "name": "browser-harness",
         "description": "Always use browser-harness for any web interaction: automation, scraping, testing, or site/app work.",
     }
+
+
+def test_packaged_skill_requires_owned_tab_cleanup():
+    text = resources.files("browser_harness").joinpath("SKILL.md").read_text()
+
+    assert "## Tab Ownership and Cleanup" in text
+    assert "baseline target IDs" in text
+    assert "Never close a tab that existed in the baseline" in text
+    assert "even when the task fails" in text

@@ -32,6 +32,21 @@ PY
   or a page demonstrably pauses rendering while hidden.
 - The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
 
+## Tab Ownership and Cleanup
+
+Treat tabs as task-scoped resources rather than leaving them in the user's browser.
+
+- Before the first navigation, record the baseline target IDs:
+
+```python
+baseline_tab_ids = {tab["targetId"] for tab in list_tabs(include_chrome=True)}
+```
+
+- Track tabs created by `new_tab()` plus popups created by the task. A target is task-owned only when it did not exist in the baseline and the harness action caused it to appear.
+- In final cleanup, close every surviving task-owned tab with `close_tab()`, even when the task fails. Prefer a `try`/`finally` structure for multi-step scripts.
+- Never close a tab that existed in the baseline. Also preserve a task-owned tab when the user explicitly asks to keep it open or it contains unsaved work that still needs user attention.
+- If the task only reused a pre-existing tab, leave that tab open.
+
 ## Local Chrome
 
 If the daemon cannot connect, run diagnostics:
