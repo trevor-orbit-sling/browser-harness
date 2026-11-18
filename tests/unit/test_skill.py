@@ -35,10 +35,9 @@ def test_packaged_skill_frontmatter_is_valid_simple_yaml():
     }
 
 
-def test_packaged_skill_requires_owned_tab_cleanup():
+def test_packaged_skill_documents_tab_modes_and_cleanup():
     text = resources.files("browser_harness").joinpath("SKILL.md").read_text()
 
-    assert "## Tab Ownership and Cleanup" in text
-    assert "baseline target IDs" in text
-    assert "Never close a tab that existed in the baseline" in text
-    assert "even when the task fails" in text
+    assert "## Tabs: three modes" in text
+    for needle in ("`work`", "`ask`", "`scrape`", "cleanup()", "never touches Trevor's own tabs", "profile="):
+        assert needle in text, needle

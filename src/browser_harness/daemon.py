@@ -7,6 +7,7 @@ from pathlib import Path
 from . import _ipc as ipc
 from . import auth
 from . import paths
+from . import markers
 from cdp_use.client import CDPClient
 
 
@@ -127,12 +128,12 @@ TOGGLE_BOOT_GRACE = 12
 # Cancellation should make an in-flight CDP call finish immediately. Keep the
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
-TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
+TAB_MARKER_JS = markers.mark_js(markers.DEFAULT_MODE)
 
 
 def tab_marker_enabled():
     """Whether the cosmetic controlled-tab title marker should be added."""
-    return os.environ.get("BH_TAB_MARKER", "").strip().lower() not in {"0", "false", "no", "off"}
+    return markers.enabled()
 
 
 def _devtools_port_live(base):
@@ -437,6 +438,11 @@ class Daemon:
         self._session_replacements = {}
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        # Tabs this daemon's helpers opened (target ids) and each tab's mode
+        # (markers.TAB_MODES). Lets cleanup() close exactly what a task created.
+        self.owned_tabs = set()
+        self.tab_modes = {}
+        self.kv = {}
         self.stop = None  # asyncio.Event, set inside start()
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
@@ -610,14 +616,15 @@ class Daemon:
                 return False
         return self._recoveries_idle.is_set()
 
-    def _schedule_tab_marker(self, session_id):
+    def _schedule_tab_marker(self, session_id, target_id=None):
         """Mark the controlled tab without extending the synchronous IPC path."""
         if not tab_marker_enabled():
             return None
+        mode = self.tab_modes.get(target_id or self.target_id, markers.DEFAULT_MODE)
         return asyncio.create_task(_silent(asyncio.wait_for(
             self.cdp.send_raw(
                 "Runtime.evaluate",
-                {"expression": TAB_MARKER_JS},
+                {"expression": markers.mark_js(mode)},
                 session_id=session_id,
             ),
             timeout=2,
@@ -737,6 +744,30 @@ class Daemon:
             self._schedule_tab_marker(new_session)
             return {"session_id": new_session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "tab_set":
+            tid = req.get("target_id")
+            if not tid:
+                return {"error": "tab_set needs target_id"}
+            if req.get("forget"):
+                self.owned_tabs.discard(tid)
+                self.tab_modes.pop(tid, None)
+                return {"ok": True}
+            if req.get("mode"):
+                if req["mode"] not in markers.TAB_MODES:
+                    return {"error": f"unknown tab mode {req['mode']!r}; use one of {sorted(markers.TAB_MODES)}"}
+                self.tab_modes[tid] = req["mode"]
+            if req.get("owned"):
+                self.owned_tabs.add(tid)
+            if tid == self.target_id and self.session:
+                self._schedule_tab_marker(self.session, tid)
+            return {"ok": True}
+        if meta == "tab_state":
+            return {"owned": sorted(self.owned_tabs), "modes": dict(self.tab_modes)}
+        if meta == "kv_get":
+            return {"value": self.kv.get(req.get("key"))}
+        if meta == "kv_set":
+            self.kv[req.get("key")] = req.get("value")
+            return {"ok": True}
         if meta == "shutdown":
             # Flip the barrier synchronously with recovery registration, then
             # cancel/drain existing handlers. In particular, a CDP replay that
@@ -808,11 +839,30 @@ class Daemon:
             return {"error": msg}
 
 
+def daemon_idle_seconds():
+    """Local daemons exit after this long with no requests (BH_DAEMON_IDLE, 0 = never).
+    The next browser-harness call starts a fresh one, so idle daemons don't pile up."""
+    try: return float(os.environ.get("BH_DAEMON_IDLE") or 1800)
+    except ValueError: return 1800.0
+
+
+async def _idle_watchdog(d, idle_seconds, poll=30.0):
+    while True:
+        await asyncio.sleep(min(poll, idle_seconds))
+        if time.monotonic() - d.last_request > idle_seconds:
+            log(f"idle for {idle_seconds:g}s; shutting down")
+            d.stop.set()
+            return
+
+
 async def serve(d):
+    d.last_request = time.monotonic()
+
     async def handler(reader, writer):
         try:
             line = await reader.readline()
             if not line: return
+            d.last_request = time.monotonic()
             resp = await d.handle(json.loads(line))
             writer.write((json.dumps(resp, default=str) + "\n").encode())
             await writer.drain()
@@ -828,13 +878,16 @@ async def serve(d):
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    idle = daemon_idle_seconds()
+    watchdog = asyncio.create_task(_idle_watchdog(d, idle)) if idle > 0 and BROWSER_KIND != "cloud" else None
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
-        for t in (serve_task, stop_task):
+        for t in (serve_task, stop_task, watchdog):
+            if t is None: continue
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass

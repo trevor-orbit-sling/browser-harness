@@ -845,3 +845,40 @@ def test_explicit_stale_session_is_not_redirected():
     assert d.cdp.calls == [
         ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
     ]
+
+
+def test_idle_watchdog_stops_daemon(monkeypatch):
+    d = _fresh_daemon()
+
+    async def run():
+        d.stop = asyncio.Event()
+        d.last_request = daemon.time.monotonic() - 10
+        await asyncio.wait_for(daemon._idle_watchdog(d, 5, poll=0.01), timeout=1)
+
+    asyncio.run(run())
+    assert d.stop.is_set()
+
+
+@pytest.mark.parametrize("value, expected", [(None, 1800.0), ("0", 0.0), ("60", 60.0), ("junk", 1800.0)])
+def test_daemon_idle_seconds(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("BH_DAEMON_IDLE", raising=False)
+    else:
+        monkeypatch.setenv("BH_DAEMON_IDLE", value)
+    assert daemon.daemon_idle_seconds() == expected
+
+
+def test_tab_set_tracks_mode_and_ownership():
+    d = _fresh_daemon()
+
+    async def run():
+        assert (await d.handle({"meta": "tab_set", "target_id": "t1", "mode": "scrape", "owned": True})) == {"ok": True}
+        bad = await d.handle({"meta": "tab_set", "target_id": "t1", "mode": "loud"})
+        state = await d.handle({"meta": "tab_state"})
+        await d.handle({"meta": "tab_set", "target_id": "t1", "forget": True})
+        return bad, state, await d.handle({"meta": "tab_state"})
+
+    bad, state, after = asyncio.run(run())
+    assert "error" in bad
+    assert state == {"owned": ["t1"], "modes": {"t1": "scrape"}}
+    assert after == {"owned": [], "modes": {}}

@@ -450,7 +450,7 @@ def test_switch_tab_keeps_visible_tab_unchanged_by_default(monkeypatch):
 
     monkeypatch.setattr(helpers, "cdp", fake_cdp)
     monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
-    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+    monkeypatch.setattr(helpers, "_mark_tab", lambda *a, **k: None)
 
     assert helpers.switch_tab({"target_id": "target-new"}) == "session-new"
     assert not any(method == "Target.activateTarget" for method, _ in calls)
@@ -467,7 +467,7 @@ def test_switch_tab_can_explicitly_activate_visible_tab(monkeypatch):
 
     monkeypatch.setattr(helpers, "cdp", fake_cdp)
     monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
-    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+    monkeypatch.setattr(helpers, "_mark_tab", lambda *a, **k: None)
 
     assert helpers.switch_tab("target-new", activate=True) == "session-new"
     assert ("Target.activateTarget", {"targetId": "target-new"}) in calls
@@ -486,14 +486,14 @@ def test_new_tab_creates_and_attaches_in_background(monkeypatch):
 
     monkeypatch.setattr(helpers, "cdp", fake_cdp)
     monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
-    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+    monkeypatch.setattr(helpers, "_mark_tab", lambda *a, **k: None)
 
     assert helpers.new_tab() == "target-new"
     assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
     assert not any(method == "Target.activateTarget" for method, _ in calls)
 
 
-def test_new_tab_reuses_an_empty_data_document(monkeypatch):
+def test_new_tab_reuses_an_owned_empty_data_document(monkeypatch):
     calls = []
     monkeypatch.setattr(
         helpers,
@@ -501,6 +501,8 @@ def test_new_tab_reuses_an_empty_data_document(monkeypatch):
         lambda: {"targetId": "target-placeholder", "url": "data:text/html,"},
     )
     monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto_url", url)))
+    monkeypatch.setattr(helpers, "set_tab_mode", lambda mode, target=None: calls.append(("mode", mode)))
+    monkeypatch.setattr(helpers, "_send", lambda req: {"owned": ["target-placeholder"], "modes": {}})
     monkeypatch.setattr(
         helpers,
         "cdp",
@@ -508,7 +510,91 @@ def test_new_tab_reuses_an_empty_data_document(monkeypatch):
     )
 
     assert helpers.new_tab("https://example.com") == "target-placeholder"
-    assert calls == [("goto_url", "https://example.com")]
+    assert calls == [("mode", "work"), ("goto_url", "https://example.com")]
+
+
+def test_new_tab_never_reuses_a_users_blank_tab(monkeypatch):
+    calls = []
+    monkeypatch.setattr(helpers, "current_tab", lambda: {"targetId": "users-tab", "url": "chrome://newtab/"})
+    monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto_url", url)))
+    monkeypatch.setattr(helpers, "switch_tab", lambda tid, activate=False: calls.append(("switch", tid, activate)))
+    monkeypatch.setattr(helpers, "_send", lambda req: calls.append(("ipc", req)) or {"owned": [], "modes": {}})
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        return {"targetId": "fresh"} if method == "Target.createTarget" else {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    assert helpers.new_tab("https://example.com") == "fresh"
+    assert ("switch", "fresh", False) in calls
+    assert ("ipc", {"meta": "tab_set", "target_id": "fresh", "mode": "work", "owned": True}) in calls
+
+
+def test_new_tab_ask_mode_comes_to_front(monkeypatch):
+    calls = []
+    monkeypatch.setattr(helpers, "switch_tab", lambda tid, activate=False: calls.append(("switch", tid, activate)))
+    monkeypatch.setattr(helpers, "_send", lambda req: calls.append(("ipc", req)) or {})
+    monkeypatch.setattr(helpers, "cdp", lambda method, **kw: {"targetId": "t-ask"} if method == "Target.createTarget" else {})
+    assert helpers.new_tab(mode="ask") == "t-ask"
+    assert ("switch", "t-ask", True) in calls
+
+
+def test_new_tab_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        helpers.new_tab("https://example.com", mode="loud")
+
+
+def test_new_tab_in_profile_uses_its_browser_context(monkeypatch):
+    calls = []
+    monkeypatch.setattr(helpers, "_profile_context", lambda p: "ctx-1")
+    monkeypatch.setattr(helpers, "switch_tab", lambda tid, activate=False: None)
+    monkeypatch.setattr(helpers, "_send", lambda req: {})
+    monkeypatch.setattr(helpers, "cdp", lambda method, **kw: calls.append((method, kw)) or {"targetId": "t"})
+    helpers.new_tab(profile="trevor@example.com")
+    assert ("Target.createTarget", {"url": "about:blank", "background": True, "browserContextId": "ctx-1"}) in calls
+
+
+def test_profile_context_matches_dir_name_or_email(monkeypatch):
+    monkeypatch.setattr(helpers, "profiles", lambda: [
+        {"dir": "Default", "name": "Personal", "email": "me@gmail.com", "context_id": "c0", "path": ""},
+        {"dir": "Profile 1", "name": "Work", "email": "me@work.com", "context_id": "c1", "path": ""},
+    ])
+    assert helpers._profile_context("Profile 1") == "c1"
+    assert helpers._profile_context("ME@WORK.COM") == "c1"
+    assert helpers._profile_context("personal") == "c0"
+    with pytest.raises(RuntimeError, match="Open profiles"):
+        helpers._profile_context("nobody@x.com")
+
+
+def test_cleanup_closes_owned_tabs_and_their_popups_only(monkeypatch):
+    closed = []
+    state = {"owned": ["work-tab", "ask-tab", "gone-tab"], "modes": {"work-tab": "work", "ask-tab": "ask"}}
+    sent = []
+    monkeypatch.setattr(helpers, "_send", lambda req: sent.append(req) or state)
+    monkeypatch.setattr(helpers, "close_tab", lambda tid: closed.append(tid))
+    monkeypatch.setattr(helpers, "cdp", lambda method, **kw: {"targetInfos": [
+        {"targetId": "users-tab", "type": "page"},
+        {"targetId": "work-tab", "type": "page"},
+        {"targetId": "ask-tab", "type": "page"},
+        {"targetId": "popup", "type": "page", "openerId": "work-tab"},
+        {"targetId": "users-popup", "type": "page", "openerId": "users-tab"},
+    ]})
+    assert helpers.cleanup() == ["popup", "work-tab"]
+    closed.clear()
+    assert helpers.cleanup(include_ask=True, keep=["popup"]) == ["ask-tab", "work-tab"]
+    assert {"meta": "tab_set", "target_id": "gone-tab", "forget": True} in sent
+
+
+def test_scrape_closes_tab_even_on_error(monkeypatch):
+    closed = []
+    monkeypatch.setattr(helpers, "new_tab", lambda url, mode="work", profile=None: "s1" if mode == "scrape" else None)
+    monkeypatch.setattr(helpers, "wait_for_load", lambda: None)
+    monkeypatch.setattr(helpers, "close_tab", lambda tid: closed.append(tid))
+    with pytest.raises(ZeroDivisionError):
+        with helpers.scrape("https://example.com") as tid:
+            assert tid == "s1"
+            1 / 0
+    assert closed == ["s1"]
 
 
 # --- press_key physical key identity (#685) ---
