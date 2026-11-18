@@ -3,12 +3,13 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, sys, time, urllib.request
+import base64, contextlib, importlib.util, json, math, os, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
 from . import _ipc as ipc
 from . import paths
+from . import markers
 
 
 CORE_DIR = Path(__file__).resolve().parent
@@ -39,7 +40,9 @@ NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 IPC_CONNECT_TIMEOUT_SECONDS = 5.0
-DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = 5.0
+# Heavy apps (Gmail, Google Admin, Docs) routinely take >5s to answer a
+# Runtime.evaluate or AX-tree call. BH_IPC_TIMEOUT overrides.
+DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = float(os.environ.get("BH_IPC_TIMEOUT") or 30.0)
 # Cloud screenshots routinely take longer than ordinary CDP round trips. Keep
 # their IPC socket alive within the caller's existing 90-second process budget.
 SCREENSHOT_IPC_RESPONSE_TIMEOUT_SECONDS = 60.0
@@ -56,7 +59,13 @@ def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
         try:
             r = ipc.request(c, token, req)
         except TimeoutError as e:
-            raise _IPCResponseTimeout from e
+            # Carry the detail on the exception itself. Raising the bare class
+            # left str(exc) empty, so every caller that reported the error had
+            # to rebuild the context by hand or print nothing useful.
+            label = req.get("method") or req.get("meta") or "request"
+            raise _IPCResponseTimeout(
+                f"{label} timed out after {response_timeout:g}s waiting for the daemon"
+            ) from e
     finally:
         c.close()
     if "error" in r: raise RuntimeError(r["error"])
@@ -190,6 +199,15 @@ def click_at_xy(x, y, button="left", clicks=1):
 def type_text(text):
     cdp("Input.insertText", text=text)
 
+_SELECT_ALL_MODIFIER = None
+def _select_all_modifier():
+    """Select-all modifier by the browser's OS (not this process's): 4=Meta on macOS, else 2=Ctrl."""
+    global _SELECT_ALL_MODIFIER
+    if _SELECT_ALL_MODIFIER is None:
+        ua = cdp("Browser.getVersion").get("userAgent", "")
+        _SELECT_ALL_MODIFIER = 4 if "Mac OS X" in ua or "Macintosh" in ua else 2
+    return _SELECT_ALL_MODIFIER
+
 def fill_input(selector, text, clear_first=True, timeout=0.0):
     """Fill a framework-managed input (React controlled, Vue v-model, Ember tracked).
 
@@ -214,11 +232,13 @@ def fill_input(selector, text, clear_first=True, timeout=0.0):
         # `char` event for single-char keys. With Ctrl/Cmd held, that `char`
         # makes Chrome treat the input as a printable "a" instead of firing the
         # select-all shortcut, leaving the field uncleared.
-        mods = 4 if sys.platform == "darwin" else 2  # Cmd on macOS, Ctrl elsewhere
+        mods = _select_all_modifier()
         select_all = {"key": "a", "code": "KeyA", "modifiers": mods,
-                      "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65}
+                      "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65,
+                      "commands": ["SelectAll"]}
         cdp("Input.dispatchKeyEvent", type="rawKeyDown", **select_all)
-        cdp("Input.dispatchKeyEvent", type="keyUp", **select_all)
+        cdp("Input.dispatchKeyEvent", type="keyUp",
+            **{k: v for k, v in select_all.items() if k != "commands"})
         press_key("Backspace")
     for ch in text:
         press_key(ch)
@@ -237,11 +257,67 @@ _KEYS = {  # key → (windowsVirtualKeyCode, code, text)
     "Home": (36, "Home", ""), "End": (35, "End", ""),
     "PageUp": (33, "PageUp", ""), "PageDown": (34, "PageDown", ""),
 }
+# US-layout physical keys for printable ASCII punctuation: char → (code, virtual key).
+# `code` names the physical key, so it is layout-independent and never the
+# character itself; the virtual key code is the Win32 VK_OEM_* value, which is
+# unrelated to ord(char) for everything except A-Z and 0-9.
+_PUNCTUATION_KEYS = {
+    "`": ("Backquote", 192), "-": ("Minus", 189), "=": ("Equal", 187),
+    "[": ("BracketLeft", 219), "]": ("BracketRight", 221), "\\": ("Backslash", 220),
+    ";": ("Semicolon", 186), "'": ("Quote", 222), ",": ("Comma", 188),
+    ".": ("Period", 190), "/": ("Slash", 191),
+}
+# Characters a US layout only produces with Shift held, mapped to the unshifted
+# character that shares their physical key.
+_SHIFTED_CHARS = {
+    "~": "`", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+    "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=",
+    "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'", "<": ",", ">": ".", "?": "/",
+}
+
+
+def _printable_key(char):
+    """(code, virtual key, needs_shift) for one printable ASCII char on a US layout.
+
+    None when the character has no US physical key — accented letters, CJK,
+    emoji. Those still insert from the char event's text, and inventing a
+    keyboard key for them would just be a different wrong answer.
+    """
+    unshifted = _SHIFTED_CHARS.get(char, char)
+    needs_shift = char in _SHIFTED_CHARS or char.isupper()
+    if unshifted.isascii() and "a" <= unshifted.lower() <= "z":
+        return f"Key{unshifted.upper()}", ord(unshifted.upper()), needs_shift
+    if unshifted.isdigit() and unshifted.isascii():
+        return f"Digit{unshifted}", ord(unshifted), needs_shift
+    if unshifted in _PUNCTUATION_KEYS:
+        code, vk = _PUNCTUATION_KEYS[unshifted]
+        return code, vk, needs_shift
+    return None
+
+
 def press_key(key, modifiers=0):
     """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift.
-    Special keys (Enter, Tab, Arrow*, Backspace, etc.) carry their virtual key codes
-    so listeners checking e.keyCode / e.key all fire."""
-    vk, code, text = _KEYS.get(key, (ord(key[0]) if len(key) == 1 else 0, key, key if len(key) == 1 else ""))
+
+    Named keys (Enter, Tab, Arrow*, Backspace, ...) and printable characters alike
+    carry the physical `code` and virtual key code a real US keyboard sends, so
+    listeners reading e.key, e.code and e.keyCode all agree. A character that
+    needs Shift on that layout (uppercase, !@#$...) sets the Shift modifier too,
+    unless the caller is already composing a shortcut with Alt/Ctrl/Meta — there,
+    the caller's intent wins over the physical truth.
+    """
+    if key in _KEYS:
+        vk, code, text = _KEYS[key]
+    elif len(key) == 1:
+        text = key
+        resolved = _printable_key(key)
+        if resolved:
+            code, vk, needs_shift = resolved
+            if needs_shift and not modifiers & (1 | 2 | 4):
+                modifiers |= 8
+        else:
+            code, vk = "", 0
+    else:
+        vk, code, text = 0, key, ""
     base = {"key": key, "code": code, "modifiers": modifiers, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
     shortcut_modifiers = modifiers & (1 | 2 | 4)  # Alt/Ctrl/Meta turn single keys into shortcuts.
     printable_char = len(key) == 1 and bool(text) and not shortcut_modifiers
@@ -251,6 +327,11 @@ def press_key(key, modifiers=0):
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
 
 def scroll(x, y, dy=-300, dx=0):
+    # Chrome never answers a wheel event in a hidden tab unless focus is
+    # emulated (background scrolls hung until the IPC timeout), and turning it
+    # off again right away defers the scroll. Leave it on for this tab.
+    try: cdp("Emulation.setFocusEmulationEnabled", enabled=True)
+    except Exception: pass
     cdp("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y, deltaX=dx, deltaY=dy)
 
 
@@ -312,10 +393,17 @@ def current_tab():
         "title": r["title"],
     }
 
-def _mark_tab():
-    """Prepend horse emoji to tab title so the user can see which tab the agent controls."""
-    try: cdp("Runtime.evaluate", expression="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title")
+def _mark_tab(mode=markers.DEFAULT_MODE):
+    """Prefix the tab title with its mode emoji (🤖 work, 🙋 ask, 🔎 scrape)."""
+    if not markers.enabled():
+        return
+    try: cdp("Runtime.evaluate", expression=markers.mark_js(mode))
     except Exception: pass
+
+
+def _tab_mode(target_id):
+    try: return _send({"meta": "tab_state"})["modes"].get(target_id, markers.DEFAULT_MODE)
+    except Exception: return markers.DEFAULT_MODE
 
 def _target_id(target):
     """Accept a raw target id or a tab dict returned by the helpers."""
@@ -334,46 +422,240 @@ def activate_tab(target):
 def switch_tab(target, activate=False):
     """Attach the agent without changing Chrome's visible tab by default.
 
-    Pass activate=True only when Chrome must visibly show the target. The horse
+    Pass activate=True only when Chrome must visibly show the target. The mode
     marker still moves to the attached target so the user can find it.
     """
     # Accept either a raw targetId string or the dict returned by current_tab() / list_tabs(),
     # so `switch_tab(current_tab())` works without a manual ["targetId"] dance.
     target_id = _target_id(target)
-    # Unmark old tab. Horse emoji is a surrogate pair in JS UTF-16 strings (2 code units),
-    # plus the trailing space = 3 code units, so slice(3) cleanly removes the prefix.
-    try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
+    # Unmark the old tab (any mode's emoji).
+    try: cdp("Runtime.evaluate", expression=markers.UNMARK_JS)
     except Exception: pass
     if activate:
         activate_tab(target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
     _send({"meta": "set_session", "session_id": sid, "target_id": target_id})
-    _mark_tab()
+    _mark_tab(_tab_mode(target_id))
     return sid
 
-def new_tab(url="about:blank"):
+_BLANK_PREFIXES = ("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab")
+
+
+def _is_blank(url):
+    url = url or ""
+    return url in ("", "about:blank", "data:text/html,") or url.startswith("about:blank#") or url.startswith(_BLANK_PREFIXES)
+
+
+def new_tab(url="about:blank", mode="work", profile=None):
+    """Open a task-owned tab and attach to it. Returns its target id.
+
+    mode: "work" (🤖 background, default), "ask" (🙋 brought to the front because
+    the user must act), or "scrape" (🔎 background; close it after extraction,
+    or use `with scrape(url):`). profile: Chrome profile dir, name, or signed-in
+    email (see profiles()); default is whichever profile Chrome picks.
+    Reuses the attached tab only if this task opened it and it is still blank.
+    """
+    if mode not in markers.TAB_MODES:
+        raise ValueError(f"mode must be one of {sorted(markers.TAB_MODES)}, got {mode!r}")
+    ctx = _profile_context(profile) if profile else None
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
     # polls and wait_for_load() returns before navigation actually starts.
     if url != "about:blank":
         try:
             cur = current_tab()
-            cur_url = cur.get("url") or ""
-            # Reuse attached tab when it's blank
-            if (
-                cur_url in ("", "about:blank", "data:text/html,")
-                or cur_url.startswith("about:blank#")
-                or cur_url.startswith(("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab"))
-            ):
+            tid = cur.get("targetId")
+            owned = tid in set(_send({"meta": "tab_state"})["owned"])
+            same_ctx = ctx is None or cdp("Target.getTargetInfo", targetId=tid)["targetInfo"].get("browserContextId") == ctx
+            if owned and same_ctx and _is_blank(cur.get("url")):
+                set_tab_mode(mode, tid)
                 goto_url(url)
-                return cur.get("targetId") or cur.get("target_id")
+                return tid
         except Exception:
             pass
-    tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-    switch_tab(tid)
+    tid = _create_blank_tab(ctx)
+    _send({"meta": "tab_set", "target_id": tid, "mode": mode, "owned": True})
+    switch_tab(tid, activate=(mode == "ask"))
     if url != "about:blank":
         goto_url(url)
     return tid
+
+
+def set_tab_mode(mode, target=None):
+    """Change a tab's mode. "ask" brings it to the front for the user; switch back
+    to "work" (stays where it is) once they are done. Returns the target id."""
+    if mode not in markers.TAB_MODES:
+        raise ValueError(f"mode must be one of {sorted(markers.TAB_MODES)}, got {mode!r}")
+    tid = _target_id(target) or current_tab()["targetId"]
+    _send({"meta": "tab_set", "target_id": tid, "mode": mode})
+    if mode == "ask":
+        activate_tab(tid)
+    if tid == current_tab()["targetId"]:
+        _mark_tab(mode)
+    return tid
+
+
+@contextlib.contextmanager
+def scrape(url, profile=None, wait=True):
+    """Background 🔎 tab that is always closed afterwards, even on error:
+
+        with scrape("https://example.com") as tid:
+            data = js("document.title")
+    """
+    tid = new_tab(url, mode="scrape", profile=profile)
+    try:
+        if wait:
+            wait_for_load()
+        yield tid
+    finally:
+        try: close_tab(tid)
+        except Exception: pass
+
+
+def cleanup(keep=(), include_ask=False):
+    """Close every tab this task opened (plus popups they spawned).
+
+    Never touches tabs that existed before. Leaves 🙋 ask tabs open unless
+    include_ask=True, and anything in `keep`. Returns the closed target ids."""
+    state = _send({"meta": "tab_state"})
+    owned, modes = set(state["owned"]), state["modes"]
+    keep = {_target_id(k) for k in keep}
+    pages = {t["targetId"]: t for t in cdp("Target.getTargets")["targetInfos"] if t["type"] == "page"}
+    popups = {tid for tid, t in pages.items() if t.get("openerId") in owned}
+    closed = []
+    for tid in sorted(owned | popups):
+        if tid not in pages or tid in keep:
+            continue
+        if modes.get(tid) == "ask" and not include_ask:
+            continue
+        try:
+            close_tab(tid)
+            closed.append(tid)
+        except Exception:
+            pass
+    for tid in owned - set(pages):
+        _send({"meta": "tab_set", "target_id": tid, "forget": True})
+    return closed
+
+
+def _eval_in(target_id, expression, user_gesture=False):
+    sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+    try:
+        r = cdp("Runtime.evaluate", session_id=sid, expression=expression,
+                returnByValue=True, userGesture=user_gesture)
+        return (r.get("result") or {}).get("value")
+    finally:
+        try: cdp("Target.detachFromTarget", sessionId=sid)
+        except Exception: pass
+
+
+def _create_blank_tab(ctx=None):
+    """Background about:blank tab, in browser context `ctx` if given.
+
+    Chrome refuses CDP tab creation in most profile contexts ("Failed to find
+    browser context"), and which one it accepts varies. Then an existing page
+    of that profile opens the tab (noopener, so the new page can't touch it)
+    and the window's visible tab is restored; the tab strip flickers ~50ms."""
+    params = {"url": "about:blank", "background": True}
+    if ctx:
+        params["browserContextId"] = ctx
+    try:
+        return cdp("Target.createTarget", **params)["targetId"]
+    except RuntimeError as e:
+        if not ctx or "Failed to find browser context" not in str(e):
+            raise
+    pages = [t for t in cdp("Target.getTargets")["targetInfos"]
+             if t["type"] == "page" and t.get("browserContextId") == ctx and t.get("url", "").startswith("http")]
+    if not pages:
+        raise RuntimeError("that Chrome profile has no open web page to open a tab from; ask the user to open one")
+    visible, hidden = [], []
+    for t in pages:
+        try: state = _eval_in(t["targetId"], "document.visibilityState")
+        except Exception: continue
+        (visible if state == "visible" else hidden).append(t["targetId"])
+    opener = (hidden or visible or [pages[0]["targetId"]])[0]
+    window = cdp("Browser.getWindowForTarget", targetId=opener)["windowId"]
+    restore = next((v for v in visible if cdp("Browser.getWindowForTarget", targetId=v)["windowId"] == window), None)
+    before = {t["targetId"] for t in cdp("Target.getTargets")["targetInfos"]}
+    _eval_in(opener, "window.open('about:blank','_blank','noopener'); true", user_gesture=True)
+    new = None
+    for _ in range(60):
+        fresh = [t for t in cdp("Target.getTargets")["targetInfos"]
+                 if t["targetId"] not in before and t["type"] == "page" and t.get("browserContextId") == ctx]
+        if fresh:
+            new = fresh[0]["targetId"]
+            break
+        time.sleep(0.05)
+    if restore:
+        try: cdp("Target.activateTarget", targetId=restore)
+        except Exception: pass
+    if not new:
+        raise RuntimeError("Chrome did not open a tab in that profile (popup blocked?)")
+    return new
+
+
+def _context_profile_dir(ctx):
+    """Profile path for a browser context, via chrome://version (cached in the daemon)."""
+    key = f"profile_path:{ctx}"
+    hit = _send({"meta": "kv_get", "key": key}).get("value")
+    if hit:
+        return hit
+    tid = _create_blank_tab(ctx)
+    try:
+        sid = cdp("Target.attachToTarget", targetId=tid, flatten=True)["sessionId"]
+        cdp("Page.navigate", session_id=sid, url="chrome://version")
+        path = ""
+        for _ in range(20):
+            r = cdp("Runtime.evaluate", session_id=sid, returnByValue=True,
+                    expression="(document.getElementById('profile_path')||{}).innerText||''")
+            path = (r.get("result") or {}).get("value") or ""
+            if path:
+                break
+            time.sleep(0.1)
+    finally:
+        try: cdp("Target.closeTarget", targetId=tid)
+        except Exception: pass
+    if path:
+        _send({"meta": "kv_set", "key": key, "value": path})
+    return path
+
+
+def profiles():
+    """Chrome profiles in the connected browser that have an open window.
+
+    Returns [{"dir", "name", "email", "context_id", "path"}]. Profiles with no
+    open window have no context and cannot host a new tab until one is opened."""
+    ctxs = []
+    for t in cdp("Target.getTargets")["targetInfos"]:
+        c = t.get("browserContextId")
+        if c and c not in ctxs and t.get("type") == "page":
+            ctxs.append(c)
+    out = []
+    for c in ctxs:
+        path = _context_profile_dir(c)
+        p = Path(path) if path else None
+        info = {}
+        if p:
+            try:
+                cache = json.loads((p.parent / "Local State").read_text())["profile"]["info_cache"]
+                info = cache.get(p.name, {})
+            except Exception:
+                pass
+        out.append({"dir": p.name if p else "", "name": info.get("name", ""),
+                    "email": info.get("user_name", ""), "context_id": c, "path": path})
+    return out
+
+
+def _profile_context(profile):
+    want = str(profile).strip().lower()
+    found = profiles()
+    for p in found:
+        if want in {p["dir"].lower(), p["name"].lower(), p["email"].lower()} - {""}:
+            return p["context_id"]
+    opts = ", ".join(f'{p["dir"]} ({p["email"] or p["name"]})' for p in found) or "none"
+    raise RuntimeError(f"no open Chrome profile matches {profile!r}. Open profiles: {opts}. "
+                       "If the profile exists but has no window, ask the user to open one.")
+
 
 def close_tab(target=None):
     """Close a tab. If `target` is omitted, closes the currently attached tab.
@@ -382,6 +664,14 @@ def close_tab(target=None):
     if target_id is None:
         target_id = current_tab()["targetId"]
     cdp("Target.closeTarget", targetId=target_id)
+    # closeTarget returns before Chrome tears the tab down (slow on heavy apps
+    # like Gmail); wait so a following list_tabs() is accurate.
+    for _ in range(40):
+        if not any(t["targetId"] == target_id for t in cdp("Target.getTargets")["targetInfos"]):
+            break
+        time.sleep(0.05)
+    try: _send({"meta": "tab_set", "target_id": target_id, "forget": True})
+    except Exception: pass
 
 
 def ensure_real_tab():
@@ -493,10 +783,39 @@ def js(expression, target_id=None):
     """
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     try:
+        result = _js_evaluate(expression, sid)
+    except BaseException:
+        # Keep the evaluation error; a detach failure here must not replace it.
+        if sid:
+            try:
+                _detach_iframe_session(sid)
+            except BaseException:
+                pass
+        raise
+    if sid:
+        _detach_iframe_session(sid)
+    return result
+
+
+def _js_evaluate(expression, sid):
+    try:
         return _runtime_evaluate(expression, session_id=sid, await_promise=True)
     except RuntimeError as e:
         if _is_illegal_return_error(e):
             return _runtime_evaluate(_wrap_js_function(expression), session_id=sid, await_promise=True)
+        raise
+
+
+def _detach_iframe_session(sid):
+    """Release the session js(target_id=...) attached so polling loops do not
+    accumulate one live session (and one event stream) per call. A session that
+    Chrome already dropped (iframe navigated or closed) is not a leak."""
+    try:
+        cdp("Target.detachFromTarget", sessionId=sid)
+    except Exception as e:
+        message = str(e).lower()
+        if "no session with given id" in message or "session with given id not found" in message:
+            return
         raise
 
 

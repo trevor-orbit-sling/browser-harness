@@ -7,6 +7,7 @@ from pathlib import Path
 from . import _ipc as ipc
 from . import auth
 from . import paths
+from . import markers
 from cdp_use.client import CDPClient
 
 
@@ -46,6 +47,7 @@ _MAC_PROFILES = (
     "Library/Application Support/Microsoft Edge Dev",
     "Library/Application Support/Microsoft Edge Canary",
     "Library/Application Support/BraveSoftware/Brave-Browser",
+    "Library/Application Support/BraveSoftware/Brave-Origin",
 )
 _LINUX_PROFILES = (
     ".config/google-chrome",
@@ -73,6 +75,31 @@ _WINDOWS_PROFILES = (  # relative to %LOCALAPPDATA%; SxS = Canary channel
 )
 
 
+def _publish_own_pid(path=PID, pid=None):
+    """Atomically retain or publish this daemon's PID record.
+
+    The parent may already have published a process-start fingerprint while
+    holding the spawn lock. Never truncate that record: another cold caller
+    must not observe an empty PID file and start a sibling daemon.
+    """
+    pid = pid or os.getpid()
+    target = Path(path)
+    try:
+        published = target.read_text()
+        try:
+            published_pid = int(json.loads(published)["pid"])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            published_pid = int(published.split()[0])
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        published = str(pid)
+        published_pid = pid
+    if published_pid != pid:
+        published = str(pid)
+    tmp = target.with_name(f"{target.name}.{pid}.tmp")
+    tmp.write_text(published)
+    os.replace(tmp, target)
+
+
 def profile_dirs(system=None):
     system = system or platform.system()
     if system == "Windows":
@@ -89,14 +116,34 @@ BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
 _REMOTE_STOPPED = False
 BROWSER_KIND = "cloud" if REMOTE_ID else ("cdp" if (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")) else "local")
-# Chrome 144+ shows a per-connection popup. Keep popup open enough to click.
-LOCAL_HANDSHAKE_TIMEOUT = 45
+# Chrome 144+ shows a per-connection popup, and the connection that raised it is
+# the only thing keeping it on screen. There is deliberately no approval
+# deadline: expiry would drop the sheet and make a later attempt create another
+# connection and another prompt. Chrome/process death and explicit cancellation
+# still terminate the pending connection.
+LOCAL_HANDSHAKE_TIMEOUT = None
 # How long get_ws_url() keeps waiting for DevToolsActivePort before giving up
 NO_TOGGLE_GRACE = 3
 TOGGLE_BOOT_GRACE = 12
 # Cancellation should make an in-flight CDP call finish immediately. Keep the
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
+TAB_MARKER_JS = markers.mark_js(markers.DEFAULT_MODE)
+
+
+def default_domains():
+    """CDP domains enabled on every attached tab (BH_ENABLE_DOMAINS, comma-separated)."""
+    raw = os.environ.get("BH_ENABLE_DOMAINS")
+    if raw is None:
+        # Runtime.enable is a well-known bot signal (Shopee captchas on it) and no
+        # helper needs Runtime events; Runtime.evaluate works without it.
+        return ("Page", "DOM", "Network")
+    return tuple(d.strip() for d in raw.split(",") if d.strip())
+
+
+def tab_marker_enabled():
+    """Whether the cosmetic controlled-tab title marker should be added."""
+    return markers.enabled()
 
 
 def _devtools_port_live(base):
@@ -372,7 +419,7 @@ def is_reusable_new_tab_page(t):
 
 
 class _PatientCDPClient(CDPClient):
-    """CDPClient with the WS opening handshake stretched to LOCAL_HANDSHAKE_TIMEOUT."""
+    """CDPClient whose local Chrome approval handshake has no deadline."""
 
     async def start(self):
         import websockets
@@ -401,6 +448,11 @@ class Daemon:
         self._session_replacements = {}
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        # Tabs this daemon's helpers opened (target ids) and each tab's mode
+        # (markers.TAB_MODES). Lets cleanup() close exactly what a task created.
+        self.owned_tabs = set()
+        self.tab_modes = {}
+        self.kv = {}
         self.stop = None  # asyncio.Event, set inside start()
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
@@ -524,7 +576,7 @@ class Daemon:
                 )
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
-        await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+        await asyncio.gather(*(enable_one(d) for d in default_domains()))
 
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
@@ -574,6 +626,29 @@ class Daemon:
                 return False
         return self._recoveries_idle.is_set()
 
+    def _schedule_tab_marker(self, session_id, target_id=None):
+        """Mark the controlled tab without extending the synchronous IPC path."""
+        if not tab_marker_enabled():
+            return None
+        mode = self.tab_modes.get(target_id or self.target_id, markers.DEFAULT_MODE)
+        return asyncio.create_task(_silent(asyncio.wait_for(
+            self.cdp.send_raw(
+                "Runtime.evaluate",
+                {"expression": markers.mark_js(mode)},
+                session_id=session_id,
+            ),
+            timeout=2,
+        )))
+
+    def _record_event(self, method, params, session_id=None):
+        self.events.append({"method": method, "params": params, "session_id": session_id})
+        if method == "Page.javascriptDialogOpening":
+            self.dialog = params
+        elif method == "Page.javascriptDialogClosed":
+            self.dialog = None
+        elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
+            self._schedule_tab_marker(self.session)
+
     async def start(self):
         self.stop = asyncio.Event()
         url = get_ws_url()
@@ -593,21 +668,14 @@ class Daemon:
                 )
             if BROWSER_KIND == "local" and ("timed out" in str(e).lower() or "403" in str(e)) and remote_debugging_user_enabled():
                 raise RuntimeError(
-                    f"permission-blocked: Chrome's 'Allow remote debugging?' popup was not accepted within {LOCAL_HANDSHAKE_TIMEOUT}s"
-                    " -- wait for the user to click Allow, then retry"
+                    "permission-blocked: Chrome did not approve the remote debugging connection; "
+                    "browser-harness did not retry or create another connection"
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
         await self.attach_first_page()
         orig = self.cdp._event_registry.handle_event
-        mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
         async def tap(method, params, session_id=None):
-            self.events.append({"method": method, "params": params, "session_id": session_id})
-            if method == "Page.javascriptDialogOpening":
-                self.dialog = params
-            elif method == "Page.javascriptDialogClosed":
-                self.dialog = None
-            elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
-                asyncio.create_task(_silent(asyncio.wait_for(self.cdp.send_raw("Runtime.evaluate", {"expression": mark_js}, session_id=self.session), timeout=2)))
+            self._record_event(method, params, session_id)
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
 
@@ -683,16 +751,33 @@ class Daemon:
             await asyncio.gather(*tasks)
             # 🐴 tab-marker title prefix is purely cosmetic — fire-and-forget so
             # it doesn't add to the synchronous IPC budget.
-            asyncio.create_task(_silent(asyncio.wait_for(
-                self.cdp.send_raw(
-                    "Runtime.evaluate",
-                    {"expression": "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"},
-                    session_id=new_session,
-                ),
-                timeout=2,
-            )))
+            self._schedule_tab_marker(new_session)
             return {"session_id": new_session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "tab_set":
+            tid = req.get("target_id")
+            if not tid:
+                return {"error": "tab_set needs target_id"}
+            if req.get("forget"):
+                self.owned_tabs.discard(tid)
+                self.tab_modes.pop(tid, None)
+                return {"ok": True}
+            if req.get("mode"):
+                if req["mode"] not in markers.TAB_MODES:
+                    return {"error": f"unknown tab mode {req['mode']!r}; use one of {sorted(markers.TAB_MODES)}"}
+                self.tab_modes[tid] = req["mode"]
+            if req.get("owned"):
+                self.owned_tabs.add(tid)
+            if tid == self.target_id and self.session:
+                self._schedule_tab_marker(self.session, tid)
+            return {"ok": True}
+        if meta == "tab_state":
+            return {"owned": sorted(self.owned_tabs), "modes": dict(self.tab_modes)}
+        if meta == "kv_get":
+            return {"value": self.kv.get(req.get("key"))}
+        if meta == "kv_set":
+            self.kv[req.get("key")] = req.get("value")
+            return {"ok": True}
         if meta == "shutdown":
             # Flip the barrier synchronously with recovery registration, then
             # cancel/drain existing handlers. In particular, a CDP replay that
@@ -764,11 +849,30 @@ class Daemon:
             return {"error": msg}
 
 
+def daemon_idle_seconds():
+    """Local daemons exit after this long with no requests (BH_DAEMON_IDLE, 0 = never).
+    The next browser-harness call starts a fresh one, so idle daemons don't pile up."""
+    try: return float(os.environ.get("BH_DAEMON_IDLE") or 1800)
+    except ValueError: return 1800.0
+
+
+async def _idle_watchdog(d, idle_seconds, poll=30.0):
+    while True:
+        await asyncio.sleep(min(poll, idle_seconds))
+        if time.monotonic() - d.last_request > idle_seconds:
+            log(f"idle for {idle_seconds:g}s; shutting down")
+            d.stop.set()
+            return
+
+
 async def serve(d):
+    d.last_request = time.monotonic()
+
     async def handler(reader, writer):
         try:
             line = await reader.readline()
             if not line: return
+            d.last_request = time.monotonic()
             resp = await d.handle(json.loads(line))
             writer.write((json.dumps(resp, default=str) + "\n").encode())
             await writer.drain()
@@ -784,13 +888,16 @@ async def serve(d):
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    idle = daemon_idle_seconds()
+    watchdog = asyncio.create_task(_idle_watchdog(d, idle)) if idle > 0 and BROWSER_KIND != "cloud" else None
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
-        for t in (serve_task, stop_task):
+        for t in (serve_task, stop_task, watchdog):
+            if t is None: continue
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass
@@ -836,7 +943,7 @@ if __name__ == "__main__":
         print(f"daemon already running on {SOCK}", file=sys.stderr)
         sys.exit(0)
     open(LOG, "w").close()
-    open(PID, "w").write(str(os.getpid()))
+    _publish_own_pid()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

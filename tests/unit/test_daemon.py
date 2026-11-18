@@ -1,8 +1,27 @@
 import asyncio
+import os
 
 import pytest
 
 from browser_harness import daemon
+
+
+def test_publish_own_pid_never_truncates_parent_record(tmp_path, monkeypatch):
+    pid_file = tmp_path / "daemon.pid"
+    pid_file.write_text('{"pid":4321,"started":"process start with spaces"}')
+    real_replace = os.replace
+    observed = []
+
+    def replace(src, dst):
+        observed.append(pid_file.read_text())
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    daemon._publish_own_pid(pid_file, pid=4321)
+
+    expected = '{"pid":4321,"started":"process start with spaces"}'
+    assert observed == [expected]
+    assert pid_file.read_text() == expected
 
 
 @pytest.mark.parametrize(
@@ -74,6 +93,58 @@ def _fresh_daemon():
     return d
 
 
+@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
+def test_tab_marker_can_be_disabled_before_set_session_schedules_it(monkeypatch, value):
+    monkeypatch.setenv("BH_TAB_MARKER", value)
+    d = _fresh_daemon()
+
+    async def run():
+        await d.handle({
+            "meta": "set_session",
+            "session_id": "session-without-marker",
+            "target_id": "target-without-marker",
+        })
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
+
+
+def test_tab_marker_stays_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    d = _fresh_daemon()
+
+    async def run():
+        await d.handle({
+            "meta": "set_session",
+            "session_id": "session-with-marker",
+            "target_id": "target-with-marker",
+        })
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"] == [
+        (
+            "Runtime.evaluate",
+            {"expression": daemon.TAB_MARKER_JS},
+            "session-with-marker",
+        )
+    ]
+
+
+@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
+def test_tab_marker_disabled_on_page_load_events(monkeypatch, value):
+    monkeypatch.setenv("BH_TAB_MARKER", value)
+    d = _fresh_daemon()
+    d.session = "loaded-session"
+
+    d._record_event("Page.loadEventFired", {}, "loaded-session")
+
+    assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
+
+
 def test_set_session_enables_all_four_default_domains_on_new_session():
     """Regression: switch_tab() / new_tab() in helpers.py route through the
     `set_session` IPC, which previously only enabled Page on the new
@@ -93,8 +164,8 @@ def test_set_session_enables_all_four_default_domains_on_new_session():
         method for (method, _params, sid) in d.cdp.calls
         if sid == new_session and method.endswith(".enable")
     ]
-    assert set(enabled_on_new) == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}, (
-        f"set_session must enable Page/DOM/Runtime/Network on the new session "
+    assert set(enabled_on_new) == {"Page.enable", "DOM.enable", "Network.enable"}, (
+        f"set_session must enable Page/DOM/Network on the new session "
         f"(parity with initial attach). Got: {enabled_on_new}"
     )
     assert d.session == new_session
@@ -137,7 +208,7 @@ def test_enable_default_domains_swallows_errors_per_domain():
     attempted = [m for (m, _p, _s) in d.cdp.calls]
     assert "Page.enable" in attempted
     assert "DOM.enable" in attempted  # attempted, but raised
-    assert "Runtime.enable" in attempted
+    assert "Runtime.enable" not in attempted  # bot signal, off by default
     assert "Network.enable" in attempted
 
 
@@ -232,7 +303,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
         for _ in range(50):
             await asyncio.sleep(0)
             # 5 = Network.disable on OLD + 4 enables on NEW.
-            if d.cdp.in_flight >= 5:
+            if d.cdp.in_flight >= 1 + len(daemon.default_domains()):
                 break
         peak = d.cdp.max_concurrent
         d.cdp.release.set()
@@ -240,7 +311,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
         return peak, d.cdp.calls
 
     peak, calls = asyncio.run(run())
-    assert peak == 5, (
+    assert peak == 1 + len(daemon.default_domains()), (
         f"set_session must run disable + 4 enables concurrently via gather "
         f"(observed peak in-flight = {peak}; expected 5 = 1 disable on OLD + "
         f"4 enables on NEW). Sequential await would peak at 1."
@@ -248,7 +319,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
     # Sanity: the right calls were made.
     methods = sorted({m for (m, _p, _s) in calls})
     assert "Network.disable" in methods
-    assert {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}.issubset(methods)
+    assert {"Page.enable", "DOM.enable", "Network.enable"}.issubset(methods)
 
 
 def test_set_session_first_attach_runs_four_enables_in_parallel():
@@ -284,7 +355,7 @@ def test_set_session_first_attach_runs_four_enables_in_parallel():
         }))
         for _ in range(50):
             await asyncio.sleep(0)
-            if d.cdp.in_flight >= 4:
+            if d.cdp.in_flight >= len(daemon.default_domains()):
                 break
         peak = d.cdp.max_concurrent
         d.cdp.release.set()
@@ -292,7 +363,7 @@ def test_set_session_first_attach_runs_four_enables_in_parallel():
         return peak
 
     peak = asyncio.run(run())
-    assert peak == 4, (
+    assert peak == len(daemon.default_domains()), (
         f"first set_session must run 4 enables concurrently "
         f"(observed peak = {peak}). No Network.disable should fire."
     )
@@ -396,7 +467,7 @@ def test_named_daemon_creates_dedicated_tab(monkeypatch):
     create_calls = [p for (m, p, _s) in d.cdp.calls if m == "Target.createTarget"]
     assert create_calls == [{"url": "about:blank", "background": True}]
     enabled = {m for (m, _p, s) in d.cdp.calls if s == d.session and m.endswith(".enable")}
-    assert enabled == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}
+    assert enabled == {"Page.enable", "DOM.enable", "Network.enable"}
 
 
 def test_default_daemon_still_attaches_first_page(monkeypatch):
@@ -774,3 +845,47 @@ def test_explicit_stale_session_is_not_redirected():
     assert d.cdp.calls == [
         ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
     ]
+
+
+def test_idle_watchdog_stops_daemon(monkeypatch):
+    d = _fresh_daemon()
+
+    async def run():
+        d.stop = asyncio.Event()
+        d.last_request = daemon.time.monotonic() - 10
+        await asyncio.wait_for(daemon._idle_watchdog(d, 5, poll=0.01), timeout=1)
+
+    asyncio.run(run())
+    assert d.stop.is_set()
+
+
+@pytest.mark.parametrize("value, expected", [(None, 1800.0), ("0", 0.0), ("60", 60.0), ("junk", 1800.0)])
+def test_daemon_idle_seconds(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("BH_DAEMON_IDLE", raising=False)
+    else:
+        monkeypatch.setenv("BH_DAEMON_IDLE", value)
+    assert daemon.daemon_idle_seconds() == expected
+
+
+def test_tab_set_tracks_mode_and_ownership():
+    d = _fresh_daemon()
+
+    async def run():
+        assert (await d.handle({"meta": "tab_set", "target_id": "t1", "mode": "scrape", "owned": True})) == {"ok": True}
+        bad = await d.handle({"meta": "tab_set", "target_id": "t1", "mode": "loud"})
+        state = await d.handle({"meta": "tab_state"})
+        await d.handle({"meta": "tab_set", "target_id": "t1", "forget": True})
+        return bad, state, await d.handle({"meta": "tab_state"})
+
+    bad, state, after = asyncio.run(run())
+    assert "error" in bad
+    assert state == {"owned": ["t1"], "modes": {"t1": "scrape"}}
+    assert after == {"owned": [], "modes": {}}
+
+
+def test_runtime_domain_off_by_default_but_opt_in(monkeypatch):
+    monkeypatch.delenv("BH_ENABLE_DOMAINS", raising=False)
+    assert "Runtime" not in daemon.default_domains()
+    monkeypatch.setenv("BH_ENABLE_DOMAINS", "Page, Runtime")
+    assert daemon.default_domains() == ("Page", "Runtime")

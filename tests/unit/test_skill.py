@@ -31,14 +31,13 @@ def test_packaged_skill_frontmatter_is_valid_simple_yaml():
 
     assert metadata == {
         "name": "browser-harness",
-        "description": "Always use browser-harness for any web interaction: automation, scraping, testing, or site/app work.",
+        "description": "Control a real browser via CDP: clicking, typing, navigation, logged-in sessions, JS-rendered or bot-protected pages. Not for plain HTTP fetches of public content - use curl for those.",
     }
 
 
-def test_packaged_skill_requires_owned_tab_cleanup():
+def test_packaged_skill_documents_tab_modes_and_cleanup():
     text = resources.files("browser_harness").joinpath("SKILL.md").read_text()
 
-    assert "## Tab Ownership and Cleanup" in text
-    assert "baseline target IDs" in text
-    assert "Never close a tab that existed in the baseline" in text
-    assert "even when the task fails" in text
+    assert "## Tabs: three modes" in text
+    for needle in ("`work`", "`ask`", "`scrape`", "cleanup()", "never touches Trevor's own tabs", "profile="):
+        assert needle in text, needle
