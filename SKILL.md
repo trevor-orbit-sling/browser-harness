@@ -81,8 +81,8 @@ cleanup()                                            # end of every task, in a f
   Use `keep=[tid]` for a tab he asked to keep or one holding unsaved work.
 - Only `ask` takes focus. Never call `activate_tab`, `Page.bringToFront`, or raise
   windows otherwise. Screenshots, DOM reads and CDP input all work in background
-  tabs. If a page pauses while hidden, wrap the step in
-  `cdp("Emulation.setFocusEmulationEnabled", enabled=True)` / `False`.
+  tabs (`scroll` handles focus emulation itself). If another step stalls while
+  hidden, call `cdp("Emulation.setFocusEmulationEnabled", enabled=True)` first.
 - Attaching to one of Trevor's existing tabs (`switch_tab`) is fine for reading.
   Don't navigate it away or close it.
 
@@ -96,6 +96,15 @@ cleanup()                                            # end of every task, in a f
 - Use `js(...)` for extraction. Use `fill_input`, `type_text` and `press_key` for
   input; they send real key codes. Raw CDP: `cdp("Domain.method", ...)`.
 - Screenshot only when layout or images matter.
+
+## Bot-protected sites
+
+- The tool doesn't switch on Chrome's `Runtime` debugging domain, because
+  anti-bot scripts detect it (Shopee sends you straight to `/verify/captcha`).
+  Never call `Runtime.enable` or set `BH_ENABLE_DOMAINS` to include it.
+  `js()` works without it.
+- Pace repeat visits. Shopee shows `/verify/traffic/error` after several loads
+  in a few minutes. That's a rate limit; stop and retry later.
 
 ## Gmail
 

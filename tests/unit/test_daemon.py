@@ -164,8 +164,8 @@ def test_set_session_enables_all_four_default_domains_on_new_session():
         method for (method, _params, sid) in d.cdp.calls
         if sid == new_session and method.endswith(".enable")
     ]
-    assert set(enabled_on_new) == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}, (
-        f"set_session must enable Page/DOM/Runtime/Network on the new session "
+    assert set(enabled_on_new) == {"Page.enable", "DOM.enable", "Network.enable"}, (
+        f"set_session must enable Page/DOM/Network on the new session "
         f"(parity with initial attach). Got: {enabled_on_new}"
     )
     assert d.session == new_session
@@ -208,7 +208,7 @@ def test_enable_default_domains_swallows_errors_per_domain():
     attempted = [m for (m, _p, _s) in d.cdp.calls]
     assert "Page.enable" in attempted
     assert "DOM.enable" in attempted  # attempted, but raised
-    assert "Runtime.enable" in attempted
+    assert "Runtime.enable" not in attempted  # bot signal, off by default
     assert "Network.enable" in attempted
 
 
@@ -303,7 +303,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
         for _ in range(50):
             await asyncio.sleep(0)
             # 5 = Network.disable on OLD + 4 enables on NEW.
-            if d.cdp.in_flight >= 5:
+            if d.cdp.in_flight >= 1 + len(daemon.default_domains()):
                 break
         peak = d.cdp.max_concurrent
         d.cdp.release.set()
@@ -311,7 +311,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
         return peak, d.cdp.calls
 
     peak, calls = asyncio.run(run())
-    assert peak == 5, (
+    assert peak == 1 + len(daemon.default_domains()), (
         f"set_session must run disable + 4 enables concurrently via gather "
         f"(observed peak in-flight = {peak}; expected 5 = 1 disable on OLD + "
         f"4 enables on NEW). Sequential await would peak at 1."
@@ -319,7 +319,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
     # Sanity: the right calls were made.
     methods = sorted({m for (m, _p, _s) in calls})
     assert "Network.disable" in methods
-    assert {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}.issubset(methods)
+    assert {"Page.enable", "DOM.enable", "Network.enable"}.issubset(methods)
 
 
 def test_set_session_first_attach_runs_four_enables_in_parallel():
@@ -355,7 +355,7 @@ def test_set_session_first_attach_runs_four_enables_in_parallel():
         }))
         for _ in range(50):
             await asyncio.sleep(0)
-            if d.cdp.in_flight >= 4:
+            if d.cdp.in_flight >= len(daemon.default_domains()):
                 break
         peak = d.cdp.max_concurrent
         d.cdp.release.set()
@@ -363,7 +363,7 @@ def test_set_session_first_attach_runs_four_enables_in_parallel():
         return peak
 
     peak = asyncio.run(run())
-    assert peak == 4, (
+    assert peak == len(daemon.default_domains()), (
         f"first set_session must run 4 enables concurrently "
         f"(observed peak = {peak}). No Network.disable should fire."
     )
@@ -467,7 +467,7 @@ def test_named_daemon_creates_dedicated_tab(monkeypatch):
     create_calls = [p for (m, p, _s) in d.cdp.calls if m == "Target.createTarget"]
     assert create_calls == [{"url": "about:blank", "background": True}]
     enabled = {m for (m, _p, s) in d.cdp.calls if s == d.session and m.endswith(".enable")}
-    assert enabled == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}
+    assert enabled == {"Page.enable", "DOM.enable", "Network.enable"}
 
 
 def test_default_daemon_still_attaches_first_page(monkeypatch):
@@ -882,3 +882,10 @@ def test_tab_set_tracks_mode_and_ownership():
     assert "error" in bad
     assert state == {"owned": ["t1"], "modes": {"t1": "scrape"}}
     assert after == {"owned": [], "modes": {}}
+
+
+def test_runtime_domain_off_by_default_but_opt_in(monkeypatch):
+    monkeypatch.delenv("BH_ENABLE_DOMAINS", raising=False)
+    assert "Runtime" not in daemon.default_domains()
+    monkeypatch.setenv("BH_ENABLE_DOMAINS", "Page, Runtime")
+    assert daemon.default_domains() == ("Page", "Runtime")

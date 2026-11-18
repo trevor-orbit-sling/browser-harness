@@ -327,6 +327,11 @@ def press_key(key, modifiers=0):
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
 
 def scroll(x, y, dy=-300, dx=0):
+    # Chrome never answers a wheel event in a hidden tab unless focus is
+    # emulated (background scrolls hung until the IPC timeout), and turning it
+    # off again right away defers the scroll. Leave it on for this tab.
+    try: cdp("Emulation.setFocusEmulationEnabled", enabled=True)
+    except Exception: pass
     cdp("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y, deltaX=dx, deltaY=dy)
 
 
@@ -547,10 +552,10 @@ def _eval_in(target_id, expression, user_gesture=False):
 def _create_blank_tab(ctx=None):
     """Background about:blank tab, in browser context `ctx` if given.
 
-    Chrome only lets CDP create tabs directly in its first profile. For any
-    other profile, an existing page of that profile opens the tab (noopener, so
-    the new page can't touch it) and the window's visible tab is restored right
-    away; the tab strip flickers for ~50ms."""
+    Chrome refuses CDP tab creation in most profile contexts ("Failed to find
+    browser context"), and which one it accepts varies. Then an existing page
+    of that profile opens the tab (noopener, so the new page can't touch it)
+    and the window's visible tab is restored; the tab strip flickers ~50ms."""
     params = {"url": "about:blank", "background": True}
     if ctx:
         params["browserContextId"] = ctx

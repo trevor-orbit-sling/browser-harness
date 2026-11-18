@@ -131,6 +131,16 @@ RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
 TAB_MARKER_JS = markers.mark_js(markers.DEFAULT_MODE)
 
 
+def default_domains():
+    """CDP domains enabled on every attached tab (BH_ENABLE_DOMAINS, comma-separated)."""
+    raw = os.environ.get("BH_ENABLE_DOMAINS")
+    if raw is None:
+        # Runtime.enable is a well-known bot signal (Shopee captchas on it) and no
+        # helper needs Runtime events; Runtime.evaluate works without it.
+        return ("Page", "DOM", "Network")
+    return tuple(d.strip() for d in raw.split(",") if d.strip())
+
+
 def tab_marker_enabled():
     """Whether the cosmetic controlled-tab title marker should be added."""
     return markers.enabled()
@@ -566,7 +576,7 @@ class Daemon:
                 )
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
-        await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+        await asyncio.gather(*(enable_one(d) for d in default_domains()))
 
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
